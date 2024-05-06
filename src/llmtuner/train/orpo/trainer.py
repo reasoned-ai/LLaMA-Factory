@@ -1,7 +1,10 @@
 from collections import defaultdict
+import json
+import os
 from types import MethodType
-from typing import TYPE_CHECKING, Dict, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Literal, Optional, Tuple, Union, List
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import Trainer
@@ -9,6 +12,7 @@ from trl import DPOTrainer
 from trl.trainer.utils import disable_dropout_in_model
 
 from ...extras.constants import IGNORE_INDEX
+from ...extras.logging import get_logger
 from ..utils import create_custom_optimzer, create_custom_scheduler
 
 
@@ -16,6 +20,9 @@ if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
     from ...hparams import FinetuningArguments
+
+
+logger = get_logger(__name__)
 
 
 class CustomORPOTrainer(DPOTrainer):
@@ -125,3 +132,41 @@ class CustomORPOTrainer(DPOTrainer):
         metrics["{}odds_ratio_loss".format(prefix)] = odds_ratio_loss.detach().cpu().mean()
 
         return batch_loss, metrics
+
+    def save_predictions(self, predict_results: "PredictionOutput") -> None:
+        r"""
+        Saves model predictions to `output_dir`.
+
+        A custom behavior that not contained in Seq2SeqTrainer.
+        """
+        if not self.is_world_process_zero():
+            return
+
+        output_prediction_file = os.path.join(self.args.output_dir, "generated_predictions.jsonl")
+        logger.info(f"Saving prediction results to {output_prediction_file}")
+        logger.info(f"predict_results: {predict_results}")
+
+        labels = np.where(
+            predict_results.label_ids != IGNORE_INDEX, predict_results.label_ids, self.tokenizer.pad_token_id
+        )
+        preds = np.where(
+            predict_results.predictions != IGNORE_INDEX, predict_results.predictions, self.tokenizer.pad_token_id
+        )
+
+        for i in range(len(preds)):
+            pad_len = np.nonzero(preds[i] != self.tokenizer.pad_token_id)[0]
+            if len(pad_len):
+                preds[i] = np.concatenate(
+                    (preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1
+                )  # move pad token to last
+
+        decoded_labels = self.tokenizer.batch_decode(
+            labels, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+        with open(output_prediction_file, "w", encoding="utf-8") as writer:
+            res: List[str] = []
+            for label, pred in zip(decoded_labels, decoded_preds):
+                res.append(json.dumps({"label": label, "predict": pred}, ensure_ascii=False))
+            writer.write("\n".join(res))

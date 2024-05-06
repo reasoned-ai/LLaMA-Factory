@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from ...data import PairwiseDataCollatorWithPadding, get_dataset, split_dataset
 from ...extras.constants import IGNORE_INDEX
+from ...extras.misc import get_logits_processor
 from ...extras.ploting import plot_loss
 from ...hparams import ModelArguments
 from ...model import load_model, load_tokenizer
@@ -14,7 +15,7 @@ from .trainer import CustomORPOTrainer
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
 
-    from ...hparams import DataArguments, FinetuningArguments
+    from ...hparams import DataArguments, FinetuningArguments, GeneratingArguments
 
 
 def run_orpo(
@@ -22,6 +23,7 @@ def run_orpo(
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
     finetuning_args: "FinetuningArguments",
+    generating_args: "GeneratingArguments",
     callbacks: Optional[List["TrainerCallback"]] = None,
 ):
     tokenizer_module = load_tokenizer(model_args)
@@ -49,6 +51,12 @@ def run_orpo(
         **split_dataset(dataset, data_args, training_args),
     )
 
+    # Keyword arguments for `model.generate`
+    gen_kwargs = generating_args.to_dict()
+    gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
+    gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+    gen_kwargs["logits_processor"] = get_logits_processor()
+
     # Training
     if training_args.do_train:
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
@@ -64,6 +72,15 @@ def run_orpo(
         metrics = trainer.evaluate(metric_key_prefix="eval")
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+    # Predict
+    if training_args.do_predict:
+        predict_results = trainer.predict(dataset, metric_key_prefix="predict")
+        if training_args.predict_with_generate:  # predict_loss will be wrong if predict_with_generate is enabled
+            predict_results.metrics.pop("predict_loss", None)
+        trainer.log_metrics("predict", predict_results.metrics)
+        trainer.save_metrics("predict", predict_results.metrics)
+        trainer.save_predictions(predict_results)
 
     # Create model card
     create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)
